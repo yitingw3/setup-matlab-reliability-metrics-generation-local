@@ -5,13 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"setup-matlab-generate-matrix-local/chart"
 	"time"
 
-	"github.com/go-echarts/go-echarts/v2/charts"
-	"github.com/go-echarts/go-echarts/v2/opts"
+	"github.com/go-echarts/go-echarts/v2/components"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
@@ -52,6 +53,9 @@ type Step struct {
 	RunTime       int64  ``
 }
 
+var verNums = []string{"v1", "v2-beta"}
+var platforms = []string{"ubuntu-22.04", "macos-12", "windows-2022"}
+
 var runsRes GithubActionRunsResponse
 var jobsRes GithubActionJobsResponse
 var clientDB *mongo.Client
@@ -85,10 +89,14 @@ func getWorkflowRunsData() {
 	}
 
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
-	req.Header.Add("Authorization", "token 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")
+	req.Header.Add("Authorization", "token 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")
 	res, err := client.Do(req)
 	if err != nil {
 		panic(err)
+	}
+	// Error out if not a successful respond
+	if res.StatusCode != 200 {
+		fmt.Println("Received non-200 status code:", res.StatusCode)
 	}
 	defer res.Body.Close()
 
@@ -107,10 +115,14 @@ func getJobsData(jobsUrl string) {
 	}
 
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
-	req.Header.Add("Authorization", "token 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")
+	req.Header.Add("Authorization", "token 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")
 	res, err := client.Do(req)
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
+	}
+	// Error out if not a successful respond
+	if res.StatusCode != 200 {
+		fmt.Println("Received non-200 status code:", res.StatusCode)
 	}
 	defer res.Body.Close()
 
@@ -119,26 +131,26 @@ func getJobsData(jobsUrl string) {
 	if err != nil {
 		panic(err)
 	}
-	//fmt.Println(jobsRes.TotalCount)
+	fmt.Println(jobsRes.TotalCount)
 
-	for i, _ := range jobsRes.Jobs {
+	for i := range jobsRes.Jobs {
 		job := &jobsRes.Jobs[i]
-		//fmt.Println("=================================")
-		//fmt.Println("Job Name: ", job.Name)
+		fmt.Println("=================================")
+		fmt.Println("Job Name: ", job.Name)
 		//fmt.Println("Job StartTime: ", job.StartTime)
 		// Calculate job runtime
 		runTime := getRuntime(job.StartTime, job.CompletedTime)
 		job.RunTime = runTime
 		//fmt.Println("Job Runtime: ", job.RunTime)
 
-		for j, _ := range job.Steps {
+		for j := range job.Steps {
 			step := &job.Steps[j]
-			//fmt.Println("=============================")
-			//fmt.Println("  Step Name: ", step.Name)
+			fmt.Println("=============================")
+			fmt.Println("  Step Name: ", step.Name)
 			//fmt.Println("  Step Status: ", step.Status)
 			runtime := getRuntime(step.StartTime, step.CompletedTime)
 			step.RunTime = runtime
-			//fmt.Println("  Step Runtime: ", step.RunTime)
+			fmt.Println("  Step Runtime: ", step.RunTime)
 		}
 	}
 
@@ -201,7 +213,7 @@ func disconnectDB() {
 func insertJobData(clientDB *mongo.Client, ctx context.Context) {
 
 	//Insert latest data
-	db := clientDB.Database("setupMatlabPerfDB")
+	db := clientDB.Database(dbName)
 	collection := db.Collection("jobs")
 	for _, job := range jobsRes.Jobs {
 		_, err := collection.InsertOne(ctx, bson.M{
@@ -223,7 +235,7 @@ func insertJobData(clientDB *mongo.Client, ctx context.Context) {
 
 func deleteOldData(clientDB *mongo.Client, ctx context.Context) {
 
-	db := clientDB.Database("setupMatlabPerfDB")
+	db := clientDB.Database(dbName)
 	allCollections, err := db.ListCollectionNames(ctx, bson.D{})
 	if err != nil {
 		log.Fatal(err.Error())
@@ -242,65 +254,29 @@ func deleteOldData(clientDB *mongo.Client, ctx context.Context) {
 
 }
 
-func getFailureRate(verNum string, os string) float32 {
-
-	coll := clientDB.Database(dbName).Collection("jobs")
-	filter := bson.D{
-		{"$and",
-			bson.A{
-				//select data
-				bson.D{{"conclusion", "failure"}},
-				bson.D{{"name", bson.D{{"$regex", verNum}}}},
-				bson.D{{"name", bson.D{{"$regex", os}}}},
-			}},
-	}
-	failureCount, err := coll.CountDocuments(context.TODO(), filter)
-	if err != nil {
-		log.Fatal(err)
-	}
-	opts := options.Count().SetHint("_id_")
-	totalCount, err := coll.CountDocuments(context.TODO(), bson.D{}, opts)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	failureRate := float32(failureCount) / float32(totalCount) * 100
-
-	return failureRate
-}
-
-var verNums = []string{"v1", "v2-beta"}
-var platforms = []string{"ubuntu-22.04", "macos-12", "windows-2022"}
-
 //var jobNames = []string{"build-v1 (windows-2022)", "build-v1 (ubuntu-22.04)", "build-v1 (macos-12)",
 //	"build-v2-beta (windows-2022)", "build-v2-beta (ubuntu-22.04)", "build-v2-beta (macos-12)"}
 
+func logRequest(handler http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("%s %s %s\n", r.RemoteAddr, r.Method, r.URL)
+		handler.ServeHTTP(w, r)
+	})
+}
+
 func genChart() {
-	bar := charts.NewBar()
-	bar.SetGlobalOptions(
-		charts.WithTitleOpts(opts.Title{
-			Title: "Historical Failure Rate",
-		},
-		))
-
-	failureRatesMap := make(map[string][]opts.BarData)
-	bar.SetXAxis(verNums)
-	for _, os := range platforms {
-		failureRateOs := make([]opts.BarData, 0)
-		for _, verNum := range verNums {
-			failRate := getFailureRate(verNum, os)
-			failureRateOs = append(failureRateOs, opts.BarData{Value: failRate})
-		}
-		failureRatesMap[os] = failureRateOs
-		bar.AddSeries(os, failureRateOs)
+	page := components.NewPage()
+	page.AddCharts(
+		//Add the Historical Failure Rate
+		chart.BarTooltip(clientDB),
+	)
+	f, err := os.Create("charts/html/Performance.html")
+	if err != nil {
+		panic(err)
 	}
+	page.Render(io.MultiWriter(f))
 
-	//failRateV1 := getFailureRate("v1")
-	//failRateV2Beta := getFailureRate("v2-beta")
-	//items := make([]opts.BarData, 0)
-	//items = append(items, opts.BarData{Value: failRateV1})
-	//items = append(items, opts.BarData{Value: failRateV2Beta})
-
-	f, _ := os.Create("bar.html")
-	bar.Render(f)
+	fs := http.FileServer(http.Dir("charts/html"))
+	log.Println("running server at http://localhost:3001")
+	log.Fatal(http.ListenAndServe("localhost:3001", logRequest(fs)))
 }
